@@ -29,6 +29,7 @@ Bu pipeline, belirli bir protein bağlanma cevine yönelik **yeni ligand molekü
 conda create -n reinvent-pipeline python=3.9
 conda activate reinvent-pipeline
 
+---
 
 ### 2. Bağımlılıkları kurun
 ```bash
