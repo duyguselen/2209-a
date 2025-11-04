@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-
-# Ligand Tasarımı ve Docking Pipeline (REINVENT4 + AutoDock Vina)
-
-# Bu betik, bir protein cebine özgü ligand tasarlamak, ADMET özelliklerini ve docking skorlarını hesaplamak, ardından en uygun 2 adayı seçmek için tam bir otomatik akış (pipeline) sağlar.
-
-# Yazan: Duygu İrem 
-# Tarih: 2025
+# ===============================================================
+# 🧬 Ligand Tasarımı ve Docking Pipeline (REINVENT4 + AutoDock Vina)
+# ===============================================================
+# Bu betik, bir protein cebine özgü ligand tasarlamak, ADMET 
+# özelliklerini ve docking skorlarını hesaplamak, ardından 
+# en uygun 2 adayı seçmek için tam otomatik bir akış (pipeline) sağlar.
+#
+# 💻 Geliştiren: Duygu İrem ÖZGER
+# 📅 Tarih: 2025
+# ===============================================================
 
 # ===============================================================
 # 🧩 0. GEREKLİ KÜTÜPHANELER VE AYARLAR
@@ -39,16 +42,14 @@ PDB_FILE = "/path/to/your/pocket.pdb"         # Hedef protein cep dosyası (.pdb
 MODEL_PATH = "reinvent.prior"                 # REINVENT4 önceden eğitilmiş model yolu
 NUM_LIGANDS = 200                             # Üretilecek ligand sayısı
 TOP_K = 2                                     # En iyi 2 ligand seçilecek
-OUT_DIR = "top3_prepared"                     # Çıktı klasörü
+OUT_DIR = "top2_prepared"                     # Çıktı klasörü
 os.makedirs(OUT_DIR, exist_ok=True)
-
 
 # ===============================================================
 # 🧠 2. CEP ANALİZİ
 # ===============================================================
 def analyze_pocket(pdb_file):
-# PDB cebini okur, geometrik merkezini ve boyutlarını belirler.
-
+    """PDB cebini okur, geometrik merkezini ve boyutlarını belirler."""
     if not os.path.exists(pdb_file):
         print("[HATA] PDB dosyası bulunamadı:", pdb_file)
         return None
@@ -66,13 +67,11 @@ def analyze_pocket(pdb_file):
     print(f"[OK] Pocket center: {center}, size: {size}")
     return {'mol': mol, 'coords': coords, 'center': center, 'size': size}
 
-
 # ===============================================================
 # 🤖 3. REINVENT4 İLE LİGAND TASARIMI
 # ===============================================================
 def generate_ligands_reinvent(num_ligands):
-# REINVENT4 önceden eğitilmiş 'prior' modeliyle molekül örnekler.
-    
+    """REINVENT4 önceden eğitilmiş 'prior' modeliyle molekül örnekler."""
     print("[INFO] REINVENT4 modeli yükleniyor...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(MODEL_PATH, device=device)
@@ -105,14 +104,11 @@ def generate_ligands_reinvent(num_ligands):
     print(f"[OK] Geçerli {len(ligands)} molekül üretildi.")
     return ligands
 
-
 # ===============================================================
 # 🧬 4. ADMET ve SA SKORLAMASI
 # ===============================================================
 def admet_score(mol):
-
-# Basitleştirilmiş Lipinski ve TPSA temelli bir ADMET skoru üretir.
-    
+    """Basitleştirilmiş Lipinski ve TPSA temelli bir ADMET skoru üretir."""
     lv = 0
     mw = Descriptors.MolWt(mol)
     logp = Descriptors.MolLogP(mol)
@@ -132,11 +128,8 @@ def admet_score(mol):
     score = 0.5 * lip_score + 0.3 * tpsa_score + 0.2 * logp_score
     return float(max(0.0, min(1.0, score)))
 
-
 def sa_score(mol):
-
-# Synthetic Accessibility skorunu hesaplar (1–10 arası). 
-# Düşük değerler sentez kolaylığını gösterir.
+    """Synthetic Accessibility skorunu hesaplar (1–10 arası)."""
     if not have_sa:
         return None
     try:
@@ -144,14 +137,11 @@ def sa_score(mol):
     except Exception:
         return None
 
-
 # ===============================================================
 # 🧫 5. DOCKING (AutoDock Vina)
 # ===============================================================
 def prepare_ligand_for_vina(mol, name_prefix):
-
-# Molekülü .pdbqt formatına dönüştürür (OpenBabel üzerinden).
-
+    """Molekülü .pdbqt formatına dönüştürür (OpenBabel üzerinden)."""
     pdbqt_file = os.path.join(OUT_DIR, f"{name_prefix}.pdbqt")
     mol_file = os.path.join(OUT_DIR, f"{name_prefix}.mol2")
 
@@ -161,11 +151,8 @@ def prepare_ligand_for_vina(mol, name_prefix):
 
     return pdbqt_file
 
-
 def dock_ligand(mol, pocket, name_prefix):
-  
-# AutoDock Vina ile ligand-protein docking işlemini yürütür.
-    
+    """AutoDock Vina ile ligand-protein docking işlemini yürütür."""
     pdbqt_file = prepare_ligand_for_vina(mol, name_prefix)
     out_log = os.path.join(OUT_DIR, f"{name_prefix}_vina_out.txt")
     out_pdbqt = os.path.join(OUT_DIR, f"{name_prefix}_vina_out.pdbqt")
@@ -196,18 +183,11 @@ def dock_ligand(mol, pocket, name_prefix):
                     pass
     return score
 
-
 # ===============================================================
 # 🧮 6. SKORLAMA ve EN İYİ 2 SEÇİMİ
 # ===============================================================
-
-from rdkit.Chem import AllChem
-from rdkit.DataStructs import TanimotoSimilarity
-
 def calculate_combined(ligand):
-  
-# Docking, ADMET, QED ve SA skorlarını ağırlıklı olarak birleştirir.
-
+    """Docking, ADMET, QED ve SA skorlarını ağırlıklı olarak birleştirir."""
     w_d, w_a, w_q, w_s = 0.5, 0.25, 0.2, 0.05
     sa_norm = 0.5 if ligand.get('sa') is None else (1.0 - ligand['sa'] / 10.0)
 
@@ -218,20 +198,15 @@ def calculate_combined(ligand):
         w_s * sa_norm
     )
 
-
 def select_top(ligands, k=2):
-  
-# En yüksek birleşik skora sahip ve birbirinden farklı (çeşitli) k adet ligand seçer.
-# Varsayılan: k=2
-
+    """En yüksek birleşik skora sahip ve birbirinden farklı k adet ligand seçer."""
     if not ligands:
         return []
 
-    # Skor sıralaması
     ligands.sort(key=lambda x: x['combined'], reverse=True)
     fps = [AllChem.GetMorganFingerprintAsBitVect(l['mol'], 2, 2048) for l in ligands]
 
-    selected = [0]  # İlk olarak en yüksek skorlu molekül seçilir
+    selected = [0]
     while len(selected) < k and len(selected) < len(ligands):
         best_idx, best_min_dist = None, -1
         for i, fp in enumerate(fps):
@@ -266,26 +241,23 @@ def main():
         l['dock_score'] = dock_ligand(l['mol'], pocket, l['smiles'])
         calculate_combined(l)
 
-    top3 = select_top3(ligands)
+    top2 = select_top(ligands, k=2)
 
-    # --- Çıktılar ---
     out_txt = "top2_smiles.txt"
     out_sdf = "top2.sdf"
     writer = rdmolfiles.SDWriter(out_sdf)
     with open(out_txt, "w") as f:
-        for l in top3:
+        for l in top2:
             writer.write(l['mol'])
             f.write(f"{l['smiles']}\tCombined={l['combined']:.4f}\tDock={l['dock_score']:.2f}\tQED={l['qed']:.3f}\tADMET={l['admet']:.3f}\tSA={l['sa']}\n")
     writer.close()
 
     print(f"[OK] En iyi 2 ligand kaydedildi: {out_txt}, {out_sdf}")
-    for l in top3:
+    for l in top2:
         print(l['smiles'], "Combined=", l['combined'], "Dock=", l['dock_score'], "QED=", l['qed'], "ADMET=", l['admet'], "SA=", l['sa'])
-
 
 # ===============================================================
 # 🧩 ÇALIŞTIRMA NOKTASI
 # ===============================================================
 if __name__ == "__main__":
     main()
-
