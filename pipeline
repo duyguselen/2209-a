@@ -12,7 +12,38 @@ Açıklama:
  - Docking (AutoDock Vina)
  - QED + ADMET + Docking skorlaması
  - En iyi 2 ligand seçilir, SDF + PNG olarak kaydedilir
+
+🎯 GELİŞTİRİCİ NOTLARI (TÜRKÇE):
+——————————————————————————————————————————————————————————————————————
+- Bu betik, *de novo* ilaç tasarımını otomatikleştiren entegre bir pipeline’dır.
+- Pipeline modüler yapıdadır: her adım bağımsız test edilebilir/iyileştirilebilir.
+- Hata yönetimi (error handling) sınırlıdır → üretim öncesi iyileştirilmeli.
+- REINVENT ve DeepChem modelleri önceden eğitilmiş olmalıdır; model yolları doğru olmalı.
+- AutoDock Vina’nın sistemde kurulu ve PATH’te tanımlı olması gerekir.
+- Open Babel bağımlılığı vardır → ligand format dönüşümü için gerekli.
+- Paralel işlem sayısı (N_CPU) sistemin fiziksel çekirdek sayısına göre ayarlanmalı.
+- ADMET modelleri DeepChem’in varsayılan veri dizinine (get_data_dir) bağlıdır. 
+  Bu dizinler önceden indirilmemişse tahmin başarısız olur → model checkpoint’leri kontrol edilmeli.
+- Docking skorları negatif olabilir; ‘total’ skor hesaplanırken dikkatli normalizasyon yapılmalı.
+- Lipinski filtresi "≤1 ihlal" kabul eder (kurala göre genellikle 0 ihlal tercih edilir).
+  Gerektiğinde bu eşik ayarlanabilir (örn. `lipinski_threshold = 0`).
+- EmbedMolecule optimizasyonu başarısız olabilir → try-except bloğu eklenebilir.
+- Molekül optimizasyonu için MMFF94 kullanılmıştır; alternatif olarak UFF de deneyebilirsiniz.
+- Pipeline, büyük ölçekli üretimi desteklemek için bellek ve disk kullanımını optimize etmelidir.
+- Üretilen ligandların stereo-kimyası rastgele olabilir → 3D konformasyonlarda dikkat!
+- Sonuç PNG’leri, ligandların kimyasal yapısını net göstermeli → gerektiğinde	DrawOptions() ile özelleştirilebilir.
+- SDF dosyasına skor bilgileri (QED, ADMET, Docking) eklenmemiş → SD etiketleriyle eklenebilir.
+- Pipeline, ROCm/CUDA destekli GPU’da hızlandırılabilir (özellikle REINVENT ve DeepChem için).
+- Günlük kaydı (logging) yerine print kullanılmıştır → üretim ortamı için logging modülü tercih edilmeli.
+- PDB dosyası içinde sadece proteine ait atomlar olmalı → su, iyon, kofaktör temizliği önerilir.
+- Pocket analizinde sadece atom koordinat ortalaması alınmış; daha gelişmiş algoritmalar (örn. fpocket) tercih edilebilir.
+- Docking kutusu boyutu standart sapmaya göre hesaplanmış → bu, küçük ceplerde yetersiz kalabilir.
+  Alternatif: maks-min farkı (range) kullanılarak kutu boyutu belirlenebilir.
+- REINVENT’in "sample" fonksiyonu deterministik değil → tekrarlanabilirlik için seed ayarlanmalı.
+- ADMET skoru ağırlıkları (0.3, 0.2, vb.) kullanıcıya özel olabilir → konfigürasyon dosyasına taşınabilir.
+- Pipeline’ın tamamlanma süresi ligand sayısı ve CPU sayısına doğrusal orantılı değildir → bottleneck’lar profil edilmeli.
 """
+
 import os
 import subprocess
 import numpy as np
@@ -26,6 +57,9 @@ import deepchem as dc
 # =====================
 # 0. Kullanıcı Ayarları
 # =====================
+# 📌 GELİŞTİRİCİ NOTU:
+# Bu ayarlar bir config dosyasından (JSON/YAML) okunabilir.
+# Böylece betik her seferinde elle düzenlenmek zorunda kalmaz.
 PDB_FILE = "my_pocket.pdb"
 VINA_PATH = "/usr/local/bin/vina"
 OUT_DIR = "top2_results"
@@ -39,6 +73,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # 1. Pocket Analizi
 # =====================
 def analyze_pocket(pdb_file):
+    # 📌 GELİŞTİRİCİ NOTU:
+    # Bu fonksiyon sadece koordinat ortalamasını alır.
+    # Daha gelişmiş analiz için fpocket, PyVOL veya POVME kullanılabilir.
     mol = rdmolfiles.MolFromPDBFile(pdb_file, removeHs=False)
     if mol is None:
         raise ValueError(f" Pocket dosyası okunamadı: {pdb_file}")
@@ -53,6 +90,10 @@ def analyze_pocket(pdb_file):
 # 2. Ligand Üretimi (REINVENT)
 # =====================
 def generate_ligands_reinvent(num_ligands):
+    # 📌 GELİŞTİRİCİ NOTU:
+    # REINVENT modeli büyük bellek tüketebilir.
+    # Üretim döngüsünde her iterasyonda model yeniden yüklenmiyor → iyi.
+    # Ancak scoring_function sadece QED’e dayalı → daha zengin scoring (örn. pharmacophore) eklenebilir.
     print(" REINVENT modeli yükleniyor...")
     model = load_model(MODEL_PATH)
     scoring_function = ScoringFunctionFactory().from_config({"name": "QEDScore"})
@@ -64,6 +105,8 @@ def generate_ligands_reinvent(num_ligands):
         if mol is None:
             continue
         mol = Chem.AddHs(mol)
+        # 📌 GELİŞTİRİCİ NOTU: EmbedMolecule başarısız olursa mol geçersiz kalır.
+        # İyileştirme: try-except + tekrar deneme mekanizması eklenebilir.
         AllChem.EmbedMolecule(mol, randomSeed=i)
         AllChem.MMFFOptimizeMolecule(mol)
         ligands.append({'smiles': smi, 'mol': mol})
@@ -74,6 +117,10 @@ def generate_ligands_reinvent(num_ligands):
 # 3. Lipinski Filtresi
 # =====================
 def lipinski_violations(mol):
+    # 📌 GELİŞTİRİCİ NOTU:
+    # Klasik "Rule of Five" uygulanmış.
+    # Günümüzde bu kurallar esnekleştirilebilir (örn. doğal ürünler için).
+    # İstenirse Ghose, Veber veya MDDR kuralları da eklenebilir.
     mw = Descriptors.MolWt(mol)
     logp = Descriptors.MolLogP(mol)
     hbd = rdMolDescriptors.CalcNumHBD(mol)
@@ -90,11 +137,14 @@ def lipinski_violations(mol):
 # =====================
 def calc_admet_score(mol):
     """DeepChem tabanlı 5 parametreli ADMET tahmini."""
+    # 📌 GELİŞTİRİCİ NOTU:
+    # DeepChem modelleri önceden eğitilmiş olmalı.
+    # Eğer `get_data_dir()` geçersizse, tüm tahminler 0.5 döner → bu kritik bir hata maskelenmesidir!
+    # Geliştirme önerisi: Model dosyaları var mı diye kontrol edilmeli.
     smi = Chem.MolToSmiles(mol)
     featurizer = dc.feat.MolGraphConvFeaturizer()
     mol_feat = featurizer.featurize([smi])
     
-    # Hazır modeller (DeepChem)
     model_names = {
         "caco2": dc.models.GraphConvModel(1, model_dir=dc.utils.get_data_dir() + "/admet/caco2"),
         "pgp": dc.models.GraphConvModel(1, model_dir=dc.utils.get_data_dir() + "/admet/pgp"),
@@ -107,7 +157,8 @@ def calc_admet_score(mol):
     for name, model in model_names.items():
         try:
             preds[name] = float(model.predict(mol_feat)[0][0])
-        except:
+        except Exception as e:
+            print(f"⚠️ ADMET tahmini hatası ({name}): {e}")
             preds[name] = 0.5  # belirsizse nötr skor
 
     # Normalize edilmiş genel skor (1 = ideal)
@@ -123,6 +174,9 @@ def calc_admet_score(mol):
 # 5. Docking (AutoDock Vina)
 # =====================
 def prepare_ligand_for_vina(mol, name_prefix):
+    # 📌 GELİŞTİRİCİ NOTU:
+    # Open Babel bağımlılığı var → sistemde kurulu olmalı.
+    # Alternatif: RDKit + AutoDockTools (ADT) scriptleri kullanılabilir.
     pdbqt_file = os.path.join(OUT_DIR, f"{name_prefix}.pdbqt")
     mol_file = os.path.join(OUT_DIR, f"{name_prefix}.mol2")
     Chem.MolToMol2File(mol, mol_file)
@@ -131,6 +185,9 @@ def prepare_ligand_for_vina(mol, name_prefix):
     return pdbqt_file
 
 def dock_ligand(args):
+    # 📌 GELİŞTİRİCİ NOTU:
+    # Vina komutu, pocket boyutunu standart sapmaya göre belirler.
+    # Bazı cepler için bu çok küçük/kalabalık olabilir → dinamik boyut ayarı önerilir.
     i, ligand, pocket = args
     name_prefix = f"lig_{i}"
     pdbqt_file = prepare_ligand_for_vina(ligand['mol'], name_prefix)
@@ -149,14 +206,17 @@ def dock_ligand(args):
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     score = 999.0
-    with open(out_log, "r") as f:
-        for line in f:
-            if line.strip().startswith("REMARK VINA RESULT:"):
-                try:
-                    score = float(line.strip().split()[3])
-                    break
-                except:
-                    pass
+    try:
+        with open(out_log, "r") as f:
+            for line in f:
+                if line.strip().startswith("REMARK VINA RESULT:"):
+                    try:
+                        score = float(line.strip().split()[3])
+                        break
+                    except:
+                        pass
+    except FileNotFoundError:
+        score = 999.0  # docking başarısızsa kötü skor ver
     return (i, score)
 
 # =====================
@@ -184,17 +244,23 @@ def main():
         ligands[i]['dock_score'] = score
 
     # --- Skorlama
+    # 📌 GELİŞTİRİCİ NOTU:
+    # Docking skoru negatif (düşük = iyi) olduğu için total skorda negatif katkı verilmiştir.
+    # Ancak normalizasyon (örn. /20.0) keyfidir → docking skoru dağılımına göre ayarlanmalı.
     for l in ligands:
         l['total'] = (l['qed']*0.2 + l['admet']*0.4) - (l['dock_score']/20.0)
 
     top2 = sorted(ligands, key=lambda x: x['total'], reverse=True)[:2]
 
+    # SDF kaydet
     sdf_file = os.path.join(OUT_DIR, "top2.sdf")
     writer = Chem.SDWriter(sdf_file)
     for l in top2:
+        # 📌 GELİŞTİRİCİ NOTU: SD etiketlerine skorlar eklenebilir!
         writer.write(l['mol'])
     writer.close()
 
+    # PNG görüntüleme
     img = Draw.MolsToGridImage(
         [l['mol'] for l in top2],
         molsPerRow=2,
