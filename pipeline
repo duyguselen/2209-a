@@ -2,16 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-TAM PIPELINE: REINVENT ile cep modeline uygun molekül tasarımı + Lipinski kuralları + ADMET skorları + Docking
-Yazar: Duygu İrem Özger (düzeltilmiş ve geliştirici notlarıyla zenginleştirilmiş versiyon)
-Açıklama:
- - Kullanıcı tarafından verilen cep PDB'den merkez ve boyut hesaplanır
- - REINVENT pretrained modeliyle ligand üretimi yapılır
- - Lipinski kurallarına göre filtreleme
- - ADMET skoru hesaplama
- - Docking (AutoDock Vina)
- - QED + ADMET + Docking skorlaması
- - En iyi 2 ligand seçilir, SDF + PNG olarak kaydedilir
+MASTER PIPELINE: 
+1. REINVENT RL ile ödül odaklı ligand üretimi (Lipinski + ADMET + Cep uyumu)
+2. Gerçek AutoDock Vina docking + DeepChem ADMET + Son skorlama
+3. En iyi 2 ligandı SDF + PNG olarak kaydet
+
+Yazar: Duygu İrem Özger
 
 GELİŞTİRİCİ NOTLARI (TÜRKÇE):
 ——————————————————————————————————————————————————————————————————————
@@ -32,16 +28,24 @@ GELİŞTİRİCİ NOTLARI (TÜRKÇE):
 - Pipeline, büyük ölçekli üretimi desteklemek için bellek ve disk kullanımını optimize etmelidir.
 - Üretilen ligandların stereo-kimyası rastgele olabilir → 3D konformasyonlarda dikkat!
 - Sonuç PNG’leri, ligandların kimyasal yapısını net göstermeli → gerektiğinde	DrawOptions() ile özelleştirilebilir.
-- SDF dosyasına skor bilgileri (QED, ADMET, Docking) eklenmemiş → SD etiketleriyle eklenebilir. ✅ (DÜZELTİLDİ!)
-- Pipeline’ın tamamlanma süresi ligand sayısı ve CPU sayısına doğrusal orantılı değildir → bottleneck’lar profil edilmeli.
+- SDF dosyasına skor bilgileri (QED, ADMET, Docking) eklenmiştir → SD etiketleriyle kaydedilir. 
+- Pipeline, ROCm/CUDA destekli GPU’da hızlandırılabilir (özellikle REINVENT ve DeepChem için).
 - Günlük kaydı (logging) yerine print kullanılmıştır → üretim ortamı için logging modülü tercih edilmeli.
 - PDB dosyası içinde sadece proteine ait atomlar olmalı → su, iyon, kofaktör temizliği önerilir.
 - Pocket analizinde sadece atom koordinat ortalaması alınmış; daha gelişmiş algoritmalar (örn. fpocket) tercih edilebilir.
 - Docking kutusu boyutu standart sapmaya göre hesaplanmış → bu, küçük ceplerde yetersiz kalabilir.
   Alternatif: maks-min farkı (range) kullanılarak kutu boyutu belirlenebilir.
 - REINVENT’in "sample" fonksiyonu deterministik değil → tekrarlanabilirlik için seed ayarlanmalı.
+  RL modunda `randomSeed` kullanımı önerilir.
 - ADMET skoru ağırlıkları (0.3, 0.2, vb.) kullanıcıya özel olabilir → konfigürasyon dosyasına taşınabilir.
-- Pipeline, ROCm/CUDA destekli GPU’da hızlandırılabilir (özellikle REINVENT ve DeepChem için).
+- Pipeline’ın tamamlanma süresi ligand sayısı ve CPU sayısına doğrusal orantılı değildir → bottleneck’lar profil edilmeli.
+- RL aşaması (`RL_NUM_STEPS`) varsayılan olarak 100’tür. Hızlı testler için 10, 
+  gerçek üretimde 100–500 arası önerilir. Adım sayısı arttıkça moleküller ödül fonksiyonuna daha iyi uyarlanır.
+- RL çıkışındaki moleküller hâlâ post-hoc docking ile doğrulanmalıdır → "proxy reward ≠ gerçek etkinlik".
+- Bu pipeline, hibrit bir yaklaşım sunar: 
+    • Akıllı üretim (REINVENT RL) + 
+    • Fiziksel doğrulama (Vina) + 
+    • Farmakokinetik güven (ADMET).
 """
 
 import os
@@ -52,65 +56,136 @@ from rdkit.Chem import AllChem, Descriptors, Draw, rdMolDescriptors, rdmolfiles
 from multiprocessing import Pool
 import deepchem as dc
 
-# =====================
-# 0. Kullanıcı Ayarları
-# =====================
+# ================
+# Kullanıcı Ayarları
+# ================
 PDB_FILE = "my_pocket.pdb"
-VINA_PATH = "vina"  # Eğer PATH'te değilse tam yol verin
-OUT_DIR = "top2_results"
-MODEL_PATH = "reinvent_model.pt"
-NUM_LIGANDS = 200
+PRIOR_MODEL_PATH = "reinvent.prior"
+RL_OUTPUT_DIR = "rl_results"
+RL_TOP_N = 50          # RL'den kaç molekül alınacak?
+RL_NUM_STEPS = 100     # 💡 RL adımı: Hızlı test için 10, gerçek üretimde 100-500 önerilir
+FINAL_OUT_DIR = "final_top2"
 N_CPU = 4
 
-os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(FINAL_OUT_DIR, exist_ok=True)
 
-# =====================
-# Yardımcı: ADMET model var mı?
-# =====================
-def admet_models_exist():
-    base = dc.utils.get_data_dir()
-    required = ["caco2", "pgp", "cyp3a4", "herg", "hepatotox"]
-    for r in required:
-        model_dir = os.path.join(base, "admet", r)
-        if not os.path.isdir(model_dir):
-            print(f" ADMET model eksik: {model_dir}")
-            return False
-    return True
+# ===================================================
+# AŞAMA 1: REINVENT RL ile Ödül Odaklı Üretim
+# ===================================================
+def run_reinvent_rl():
+    print("AŞAMA 1: REINVENT RL ile ödül odaklı üretim başlatılıyor...")
+    
+    try:
+        from reinvent.models import Model
+        from reinvent.runmodes import ReinforcementLearning
+        from reinvent.scoring import ScoringFunction
+        from reinvent.scoring.scoring_components import CustomComponent
+    except ImportError:
+        raise RuntimeError("REINVENT kurulu değil. Lütfen MolecularAI/Reinvent'i kurun.")
 
-# =====================
-# 1. Pocket Analizi
-# =====================
-def analyze_pocket(pdb_file):
-    mol = rdmolfiles.MolFromPDBFile(pdb_file, removeHs=False)
+    # Pocket merkezi
+    mol = rdmolfiles.MolFromPDBFile(PDB_FILE, removeHs=False)
     if mol is None:
-        raise ValueError(f"Pocket dosyası okunamadı: {pdb_file}")
+        raise ValueError(f"Pocket dosyası okunamadı: {PDB_FILE}")
     conf = mol.GetConformer()
     coords = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
-    center = np.mean(coords, axis=0)
-    size = np.std(coords, axis=0) * 2  # Kutu boyutu için standart sapmanın 2 katı
-    print(f"🧬 Pocket center = {center}, size = {size}")
-    return {'mol': mol, 'center': center, 'size': size}
+    POCKET_CENTER = np.mean(coords, axis=0)
 
-# =====================
-# 2. Lipinski İhlal Sayısı
-# =====================
+    # Yardımcı skor fonksiyonları
+    def lipinski_score(mol):
+        v = sum([
+            Descriptors.MolWt(mol) > 500,
+            Descriptors.MolLogP(mol) > 5,
+            rdMolDescriptors.CalcNumHBD(mol) > 5,
+            rdMolDescriptors.CalcNumHBA(mol) > 10
+        ])
+        return 1.0 if v == 0 else (0.5 if v == 1 else 0.0)
+
+    def admet_score(mol):
+        smi = Chem.MolToSmiles(mol)
+        featurizer = dc.feat.MolGraphConvFeaturizer()
+        try:
+            feat = featurizer.featurize([smi])
+        except:
+            return 0.0
+        base = dc.utils.get_data_dir()
+        score = 0.0
+        weights = {"caco2": 0.3, "pgp": -0.2, "cyp3a4": -0.2, "herg": -0.15, "hepatotox": -0.15}
+        for name, w in weights.items():
+            try:
+                model = dc.models.GraphConvModel.load_from_dir(os.path.join(base, "admet", name))
+                pred = float(model.predict(feat)[0][0])
+                score += w * pred if w < 0 else w * (1 - pred)
+            except:
+                pass
+        return max(0.0, min(1.0, score))
+
+    def pocket_proximity_score(mol, center):
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            return 0.0
+        AllChem.MMFFOptimizeMolecule(mol)
+        conf = mol.GetConformer()
+        coords = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
+        avg_dist = np.mean(np.linalg.norm(coords - center, axis=1))
+        return max(0.0, 1.0 - avg_dist / 15.0)
+
+    def custom_reward(smiles_list):
+        rewards = []
+        for smi in smiles_list:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                rewards.append(0.0)
+                continue
+            l = lipinski_score(mol)
+            a = admet_score(mol)
+            p = pocket_proximity_score(mol, POCKET_CENTER)
+            rewards.append(0.4*a + 0.3*l + 0.3*p)
+        return np.array(rewards)
+
+    # Modeller
+    prior = Model.load_from_file(PRIOR_MODEL_PATH)
+    agent = prior.make_copy()
+
+    # Scoring
+    component = CustomComponent(custom_reward, "RL_Reward", weight=1.0)
+    scoring_function = ScoringFunction([component], [1.0])
+
+      # RL çalıştır
+    rl = ReinforcementLearning(
+        configuration={"parameters": {
+            "scoring_function": scoring_function,
+            "num_steps": RL_NUM_STEPS,   # Artık yapılandırılabilir
+            "batch_size": 64,
+            "sigma": 64,
+            "learning_rate": 0.0001
+        }},
+        agent=agent,
+        prior=prior,
+        output_directory=RL_OUTPUT_DIR
+    )
+    rl.run()
+
+    # En iyi N molekülü al
+    top_smiles = rl.get_top_n_smiles(n=RL_TOP_N)
+    smiles_list = [smi for smi, _ in top_smiles]
+    
+    print(f"RL tamamlandı. {len(smiles_list)} molekül seçildi.")
+    return smiles_list
+
+# ===================================================
+# AŞAMA 2: Gerçek ADMET + Docking + Son Skorlama
+# ===================================================
+
 def lipinski_violations(mol):
-    mw = Descriptors.MolWt(mol)
-    logp = Descriptors.MolLogP(mol)
-    hbd = rdMolDescriptors.CalcNumHBD(mol)
-    hba = rdMolDescriptors.CalcNumHBA(mol)
-    violations = sum([
-        mw > 500,
-        logp > 5,
-        hbd > 5,
-        hba > 10
+    return sum([
+        Descriptors.MolWt(mol) > 500,
+        Descriptors.MolLogP(mol) > 5,
+        rdMolDescriptors.CalcNumHBD(mol) > 5,
+        rdMolDescriptors.CalcNumHBA(mol) > 10
     ])
-    return violations
 
-# =====================
-# 3. ADMET Skoru
-# =====================
-def calc_admet_score(mol):
+def calc_admet_score_final(mol):
     smi = Chem.MolToSmiles(mol)
     featurizer = dc.feat.MolGraphConvFeaturizer()
     try:
@@ -132,82 +207,45 @@ def calc_admet_score(mol):
         try:
             model = dc.models.GraphConvModel.load_from_dir(path)
             preds[name] = float(model.predict(mol_feat)[0][0])
-        except Exception as e:
-            print(f" ADMET model yüklenemedi ({name}): {e}")
+        except:
             preds[name] = 0.5
 
     absorption = preds["caco2"]
     distribution = 1 - preds["pgp"]
     metabolism = 1 - preds["cyp3a4"]
     toxicity = (1 - preds["herg"]) * (1 - preds["hepatotox"])
-    admet_score = 0.3 * absorption + 0.2 * distribution + 0.2 * metabolism + 0.3 * toxicity
-    return max(0.0, min(1.0, admet_score))
+    return max(0.0, min(1.0, 0.3*absorption + 0.2*distribution + 0.2*metabolism + 0.3*toxicity))
 
-# =====================
-# 4. Ligand Üretimi (REINVENT)
-# =====================
-def generate_ligands_reinvent(num_ligands, model_path):
-    print(" REINVENT modeli yükleniyor...")
-    try:
-        from reinvent.models import Model
-        model = Model.load_from_file(model_path)
-    except Exception as e:
-        raise RuntimeError(f"REINVENT modeli yüklenemedi: {e}")
+def analyze_pocket(pdb_file):
+    mol = rdmolfiles.MolFromPDBFile(pdb_file, removeHs=False)
+    conf = mol.GetConformer()
+    coords = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
+    center = np.mean(coords, axis=0)
+    size = np.std(coords, axis=0) * 2
+    return {'mol': mol, 'center': center, 'size': size}
 
-    ligands = []
-    for i in range(num_ligands):
-        try:
-            smi = model.sample()
-        except Exception:
-            continue
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            continue
-        mol = Chem.AddHs(mol)
-        try:
-            AllChem.EmbedMolecule(mol, randomSeed=i, maxAttempts=10)
-            AllChem.MMFFOptimizeMolecule(mol)
-        except:
-            continue
-
-        ligands.append({
-            'smiles': smi,
-            'mol': mol
-        })
-    print(f" {len(ligands)} geçerli ligand üretildi.")
-    return ligands
-
-# =====================
-# 5. Docking Hazırlığı ve Çalıştırma
-# =====================
 def prepare_ligand_for_vina(mol, name_prefix, out_dir):
-    mol2_file = os.path.join(out_dir, f"{name_prefix}.mol2")
-    pdbqt_file = os.path.join(out_dir, f"{name_prefix}.pdbqt")
-    Chem.MolToMol2File(mol, mol2_file)
-    cmd = ["obabel", mol2_file, "-O", pdbqt_file, "-xp"]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except subprocess.CalledProcessError:
-        return None
-    return pdbqt_file
+    mol2 = os.path.join(out_dir, f"{name_prefix}.mol2")
+    pdbqt = os.path.join(out_dir, f"{name_prefix}.pdbqt")
+    Chem.MolToMol2File(mol, mol2)
+    cmd = ["obabel", mol2, "-O", pdbqt, "-xp"]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return pdbqt
 
 def dock_ligand(args):
-    i, ligand, pocket, pdb_file, out_dir, vina_path = args
-    name_prefix = f"lig_{i}"
-    pdbqt_file = prepare_ligand_for_vina(ligand['mol'], name_prefix, out_dir)
-    if pdbqt_file is None:
-        return (i, 999.0)
-
-    out_pdbqt = os.path.join(out_dir, f"{name_prefix}_vina_out.pdbqt")
-    out_log = os.path.join(out_dir, f"{name_prefix}_vina_out.txt")
+    i, mol, pocket, pdb_file, out_dir = args
+    name = f"mol_{i}"
+    pdbqt = prepare_ligand_for_vina(mol, name, out_dir)
+    out_pdbqt = os.path.join(out_dir, f"{name}_out.pdbqt")
+    out_log = os.path.join(out_dir, f"{name}_out.log")
 
     x, y, z = pocket['center']
     sx, sy, sz = pocket['size']
 
     cmd = [
-        vina_path,
+        "vina",
         "--receptor", pdb_file,
-        "--ligand", pdbqt_file,
+        "--ligand", pdbqt,
         "--center_x", f"{x:.3f}",
         "--center_y", f"{y:.3f}",
         "--center_z", f"{z:.3f}",
@@ -217,87 +255,72 @@ def dock_ligand(args):
         "--out", out_pdbqt,
         "--log", out_log
     ]
-
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except subprocess.TimeoutExpired:
-        return (i, 999.0)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
 
     score = 999.0
     try:
-        with open(out_log, "r") as f:
+        with open(out_log) as f:
             for line in f:
-                if line.strip().startswith("REMARK VINA RESULT:"):
-                    parts = line.strip().split()
-                    if len(parts) >= 4:
-                        try:
-                            score = float(parts[3])
-                            break
-                        except ValueError:
-                            pass
-    except FileNotFoundError:
+                if "REMARK VINA RESULT:" in line:
+                    score = float(line.split()[3])
+                    break
+    except:
         pass
     return (i, score)
 
-# =====================
-# 6. Ana İşlem
-# =====================
 def main():
-    print("TAM Pipeline Başlatılıyor...")
+    print("MASTER PIPELINE: RL + Gerçek Docking + Final Seçim")
     
-    # ADMET modelleri kontrolü
-    if not admet_models_exist():
-        print("ADMET modelleri eksik. Lütfen DeepChem ADMET modellerini indirin.")
-        return
+    # AŞAMA 1: RL Üretimi
+    smiles_list = run_reinvent_rl()
+    
+    # Molekülleri hazırla
+    ligands = []
+    for i, smi in enumerate(smiles_list):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=i) == 0:
+            AllChem.MMFFOptimizeMolecule(mol)
+            ligands.append({'smiles': smi, 'mol': mol})
 
-    # Pocket analizi
-    pocket = analyze_pocket(PDB_FILE)
-
-    # Ligand üretimi
-    ligands = generate_ligands_reinvent(NUM_LIGANDS, MODEL_PATH)
-
-    # Lipinski filtresi (≤1 ihlal)
+    # Lipinski filtresi
     ligands = [l for l in ligands if lipinski_violations(l['mol']) <= 1]
-    print(f" {len(ligands)} ligand Lipinski (≤1 ihlal) filtresinden geçti.")
+    print(f"🧪 {len(ligands)} ligand Lipinski filtresinden geçti.")
 
-    if len(ligands) == 0:
-        print("Filtreden geçen ligand yok!")
-        return
+    if not ligands:
+        raise RuntimeError("Filtreden geçen ligand yok!")
 
-    # ADMET skoru hesaplama
-    print("ADMET skorları hesaplanıyor...")
+    # ADMET
+    print("Gerçek ADMET skorları hesaplanıyor...")
     for l in ligands:
-        l['admet'] = calc_admet_score(l['mol'])
+        l['admet'] = calc_admet_score_final(l['mol'])
 
-    # Lipinski skoru hesaplama (0 ihlal = 1.0, 1 ihlal = 0.5)
+    # Lipinski skoru
     for l in ligands:
         v = lipinski_violations(l['mol'])
-        l['lipinski_score'] = 1.0 if v == 0 else (0.5 if v == 1 else 0.0)
+        l['lipinski_score'] = 1.0 if v == 0 else 0.5
 
-    # Docking (paralel)
-    print("🔬 Docking başlatılıyor...")
-    dock_args = [
-        (i, l, pocket, PDB_FILE, OUT_DIR, VINA_PATH)
-        for i, l in enumerate(ligands)
-    ]
+    # Docking
+    print("🔬 Gerçek AutoDock Vina docking başlatılıyor...")
+    pocket = analyze_pocket(PDB_FILE)
+    dock_args = [(i, l['mol'], pocket, PDB_FILE, FINAL_OUT_DIR) for i, l in enumerate(ligands)]
     with Pool(N_CPU) as pool:
-        docking_results = pool.map(dock_ligand, dock_args)
-
-    for i, score in docking_results:
+        results = pool.map(dock_ligand, dock_args)
+    for i, score in results:
         ligands[i]['dock_score'] = score
 
-    # Toplam skor hesaplama
+    # Final skor (docking düşük = iyi → ters normalize)
     for l in ligands:
-        # Docking: düşük = iyi → ters orantılı normalizasyon
         dock_norm = max(0.0, min(1.0, (20.0 - max(l['dock_score'], -20.0)) / 40.0))
-        l['total'] = 0.4 * l['admet'] + 0.3 * l['lipinski_score'] + 0.3 * dock_norm
+        l['total'] = 0.4*l['admet'] + 0.3*l['lipinski_score'] + 0.3*dock_norm
 
-    # En iyi 2 ligand
+    # En iyi 2
     top2 = sorted(ligands, key=lambda x: x['total'], reverse=True)[:2]
 
-    # SDF kaydet (skorlarla birlikte) 
-    sdf_file = os.path.join(OUT_DIR, "top2.sdf")
-    writer = Chem.SDWriter(sdf_file)
+    # Kaydet
+    writer = Chem.SDWriter(os.path.join(FINAL_OUT_DIR, "top2.sdf"))
     for l in top2:
         mol = l['mol']
         mol.SetProp("SMILES", l['smiles'])
@@ -308,29 +331,21 @@ def main():
         writer.write(mol)
     writer.close()
 
-    # PNG görselleştirme
+    # PNG
     legends = [
-        f"Dock={l['dock_score']:.2f}\nADMET={l['admet']:.2f}\nLipinski={lipinski_violations(l['mol'])} ihlal\nTotal={l['total']:.2f}"
+        f"Dock={l['dock_score']:.2f}\nADMET={l['admet']:.2f}\nLipinski={lipinski_violations(l['mol'])} ihlal"
         for l in top2
     ]
-    img = Draw.MolsToGridImage(
-        [l['mol'] for l in top2],
-        molsPerRow=2,
-        subImgSize=(400, 400),
-        legends=legends
-    )
-    img.save(os.path.join(OUT_DIR, "top2_ligands.png"))
+    img = Draw.MolsToGridImage([l['mol'] for l in top2], molsPerRow=2, subImgSize=(400,400), legends=legends)
+    img.save(os.path.join(FINAL_OUT_DIR, "top2_ligands.png"))
 
-    # Sonuç yazdırma
-    print("\n En iyi 2 ligand:")
+    print("\n EN İYİ 2 LİGAND:")
     for i, l in enumerate(top2, 1):
         v = lipinski_violations(l['mol'])
         print(f"{i}. {l['smiles']}")
-        print(f"   Dock={l['dock_score']:.2f} | ADMET={l['admet']:.2f} | Lipinski ihlal={v} | Total={l['total']:.2f}")
+        print(f"   Dock: {l['dock_score']:.2f} | ADMET: {l['admet']:.2f} | Lipinski: {v} ihlal")
 
-    print(f"\n Sonuçlar '{OUT_DIR}' klasöründe kaydedildi.")
+    print(f"\n📁 Sonuçlar: {FINAL_OUT_DIR}/")
 
-
-# =====================
 if __name__ == "__main__":
     main()
