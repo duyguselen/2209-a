@@ -166,9 +166,9 @@ def run_reinvent_rl():
     )
     rl.run()
 
-    # En iyi N molekülü al
-    top_smiles = rl.get_top_n_smiles(n=RL_TOP_N)
-    smiles_list = [smi for smi, _ in top_smiles]
+    # En iyi 50 molekülü al
+    top_smiles = rl.get_top_50_smiles(n=RL_TOP_50)
+    smiles_list = [smi for smi, 50 in top_smiles]
     
     print(f"RL tamamlandı. {len(smiles_list)} molekül seçildi.")
     return smiles_list
@@ -287,7 +287,7 @@ def main():
 
     # Lipinski filtresi
     ligands = [l for l in ligands if lipinski_violations(l['mol']) <= 1]
-    print(f"🧪 {len(ligands)} ligand Lipinski filtresinden geçti.")
+    print(f"{len(ligands)} ligand Lipinski filtresinden geçti.")
 
     if not ligands:
         raise RuntimeError("Filtreden geçen ligand yok!")
@@ -345,7 +345,7 @@ def main():
         print(f"{i}. {l['smiles']}")
         print(f"   Dock: {l['dock_score']:.2f} | ADMET: {l['admet']:.2f} | Lipinski: {v} ihlal")
 
-    print(f"\n📁 Sonuçlar: {FINAL_OUT_DIR}/")
+    print(f"\n Sonuçlar: {FINAL_OUT_DIR}/")
 
 if __name__ == "__main__":
     main()
