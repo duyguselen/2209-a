@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-MASTER PIPELINE: 
+MASTER PIPELINE:  
 1. REINVENT RL ile ödül odaklı ligand üretimi (Lipinski + ADMET + Cep uyumu)
 2. Gerçek AutoDock Vina docking + DeepChem ADMET + Son skorlama
 3. En iyi 2 ligandı SDF + PNG olarak kaydet
